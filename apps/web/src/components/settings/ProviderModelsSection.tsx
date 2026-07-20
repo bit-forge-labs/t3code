@@ -19,6 +19,7 @@ import {
 import { normalizeCustomModelSlug } from "@t3tools/shared/model";
 
 import { cn } from "../../lib/utils";
+import { formatContextWindowTokens } from "../../lib/contextWindow";
 import { sortModelsForProviderInstance } from "../../modelOrdering";
 import { MAX_CUSTOM_MODEL_LENGTH } from "../../modelSelection";
 import { Button } from "../ui/button";
@@ -221,7 +222,12 @@ export function ProviderModelsSection({
           ) {
             capLabels.push("Reasoning");
           }
-          const hasDetails = capLabels.length > 0 || model.name !== model.slug;
+          if (caps?.contextWindowTokens !== undefined) {
+            capLabels.push(`Context ${formatContextWindowTokens(caps.contextWindowTokens)}`);
+          }
+          const modelDescription = model.description?.trim();
+          const hasDetails =
+            capLabels.length > 0 || Boolean(modelDescription) || model.name !== model.slug;
 
           return (
             <div
@@ -257,6 +263,9 @@ export function ProviderModelsSection({
                     <TooltipPopup side="top" className="max-w-56">
                       <div className="space-y-1">
                         <code className="block text-[11px] text-foreground">{model.slug}</code>
+                        {modelDescription ? (
+                          <p className="text-[10px] text-muted-foreground">{modelDescription}</p>
+                        ) : null}
                         {capLabels.length > 0 ? (
                           <div className="flex flex-wrap gap-x-2 gap-y-0.5">
                             {capLabels.map((label) => (
