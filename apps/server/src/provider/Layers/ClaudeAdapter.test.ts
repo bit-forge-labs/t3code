@@ -21,7 +21,7 @@ import {
   ThreadId,
   ProviderInstanceId,
 } from "@t3tools/contracts";
-import { createModelSelection } from "@t3tools/shared/model";
+import { createModelCapabilities, createModelSelection } from "@t3tools/shared/model";
 import { assert, describe, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -156,6 +156,7 @@ function makeHarness(config?: {
   readonly baseDir?: string;
   readonly claudeConfig?: Partial<ClaudeSettings>;
   readonly instanceId?: ProviderInstanceId;
+  readonly resolveModelCapabilities?: ClaudeAdapterLiveOptions["resolveModelCapabilities"];
 }) {
   const query = new FakeClaudeQuery();
   let createInput:
@@ -180,6 +181,9 @@ function makeHarness(config?: {
       ? {
           nativeEventLogPath: config.nativeEventLogPath,
         }
+      : {}),
+    ...(config?.resolveModelCapabilities
+      ? { resolveModelCapabilities: config.resolveModelCapabilities }
       : {}),
   };
 
@@ -412,6 +416,68 @@ describe("ClaudeAdapterLive", () => {
 
       const createInput = harness.getLastCreateQueryInput();
       assert.equal(createInput?.options.effort, "max");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("forwards a discovered proxy model's effort and verbatim id", () => {
+    const proxyCaps = createModelCapabilities({
+      optionDescriptors: [
+        {
+          id: "effort",
+          label: "Reasoning",
+          type: "select",
+          options: [
+            { id: "low", label: "Low" },
+            { id: "high", label: "High", isDefault: true },
+          ],
+        },
+      ],
+    });
+    const harness = makeHarness({
+      resolveModelCapabilities: () => Effect.succeed(proxyCaps),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: createModelSelection(ProviderInstanceId.make("claudeAgent"), "gpt-5.4", [
+          { id: "effort", value: "low" },
+        ]),
+        runtimeMode: "full-access",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(createInput?.options.effort, "low");
+      // Non-Anthropic id is passed verbatim, never with a [1m] routing suffix.
+      assert.equal(createInput?.options.model, "gpt-5.4");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("does not invent effort for an unknown model without discovery", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "some-unknown-model",
+          [{ id: "effort", value: "high" }],
+        ),
+        runtimeMode: "full-access",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(createInput?.options.effort, undefined);
+      assert.equal(createInput?.options.model, "some-unknown-model");
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),

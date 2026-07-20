@@ -32,6 +32,7 @@ import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 
 import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
 import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
+import type { ClaudeModelDiscoveryOutcome } from "./ClaudeModelDiscovery.ts";
 import * as OpenCodeRuntime from "../opencodeRuntime.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./ProviderInstanceRegistryHydration.ts";
@@ -53,7 +54,8 @@ const decodeServerSettings = Schema.decodeSync(ServerSettings);
 const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const encodedDefaultServerSettings = encodeServerSettings(DEFAULT_SERVER_SETTINGS);
 
-const defaultClaudeSettings: ClaudeSettings = Schema.decodeSync(ClaudeSettings)({});
+const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
+const defaultClaudeSettings: ClaudeSettings = decodeClaudeSettings({});
 const defaultCodexSettings: CodexSettings = Schema.decodeSync(CodexSettings)({});
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 const disabledCodexSettings: CodexSettings = Schema.decodeSync(CodexSettings)({
@@ -1972,6 +1974,175 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             }),
           ),
         ),
+      );
+
+      // ── gateway model discovery ──────────────────────────────────
+
+      const gatewayEnv = { ANTHROPIC_BASE_URL: "http://localhost:8317" } as NodeJS.ProcessEnv;
+      const readyClaudeSpawner = mockSpawnerLayer((args) => {
+        const joined = args.join(" ");
+        if (joined === "--version") return { stdout: "2.1.170\n", stderr: "", code: 0 };
+        throw new Error(`Unexpected args: ${joined}`);
+      });
+      const discovery =
+        (outcome: ClaudeModelDiscoveryOutcome) => (): Effect.Effect<ClaudeModelDiscoveryOutcome> =>
+          Effect.succeed(outcome);
+
+      it.effect("adds discovered non-Anthropic models with effort and context metadata", () =>
+        Effect.gen(function* () {
+          const status = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            claudeCapabilities(),
+            gatewayEnv,
+            discovery({
+              kind: "discovered",
+              tier: "expanded",
+              models: [
+                {
+                  slug: "gpt-5.4",
+                  name: "GPT-5.4",
+                  description: "A capable model.",
+                  contextWindowTokens: 272_000,
+                  maxContextWindowTokens: 400_000,
+                  effortLevels: [{ value: "low" }, { value: "high", isDefault: true }],
+                },
+              ],
+            }),
+          );
+          assert.strictEqual(status.status, "ready");
+          const model = status.models.find((candidate) => candidate.slug === "gpt-5.4");
+          assert.ok(model, "expected discovered model to be present");
+          assert.strictEqual(model?.isCustom, false);
+          assert.strictEqual(model?.description, "A capable model.");
+          // The proxy is authoritative: built-in Claude models it did not report
+          // must NOT be listed.
+          assert.strictEqual(
+            status.models.some((candidate) => candidate.slug === "claude-opus-4-8"),
+            false,
+            "undetected built-in Claude models must not be listed for a gateway instance",
+          );
+          assert.strictEqual(model?.capabilities?.contextWindowTokens, 272_000);
+          assert.strictEqual(model?.capabilities?.maxContextWindowTokens, 400_000);
+          const effort = model?.capabilities?.optionDescriptors?.find(
+            (descriptor) => descriptor.type === "select" && descriptor.id === "effort",
+          );
+          assert.deepStrictEqual(
+            effort?.type === "select"
+              ? effort.options.map((option) => ({ id: option.id, isDefault: option.isDefault }))
+              : undefined,
+            [
+              { id: "low", isDefault: undefined },
+              { id: "high", isDefault: true },
+            ],
+          );
+        }).pipe(Effect.provide(readyClaudeSpawner)),
+      );
+
+      it.effect("augments only the discovered built-in and drops the rest", () =>
+        Effect.gen(function* () {
+          const status = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            claudeCapabilities(),
+            gatewayEnv,
+            discovery({
+              kind: "discovered",
+              tier: "expanded",
+              models: [{ slug: "claude-opus-4-8", name: "Opus", contextWindowTokens: 1_000_000 }],
+            }),
+          );
+          const opus = status.models.find((candidate) => candidate.slug === "claude-opus-4-8");
+          assert.ok(opus, "expected the discovered built-in to be present");
+          assert.strictEqual(opus?.isCustom, false);
+          assert.strictEqual(opus?.capabilities?.contextWindowTokens, 1_000_000);
+          assert.ok(
+            opus?.capabilities?.optionDescriptors?.some(
+              (descriptor) => descriptor.type === "boolean" && descriptor.id === "fastMode",
+            ),
+            "expected the built-in fastMode control to survive augmentation",
+          );
+          // Only the proxy-served Claude model is listed; the rest of the static
+          // allowlist is dropped.
+          assert.strictEqual(
+            status.models.some((candidate) => candidate.slug === "claude-sonnet-5"),
+            false,
+          );
+        }).pipe(Effect.provide(readyClaudeSpawner)),
+      );
+
+      it.effect("lists only the built-in Claude models the proxy serves", () =>
+        Effect.gen(function* () {
+          const status = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            claudeCapabilities(),
+            gatewayEnv,
+            discovery({
+              kind: "discovered",
+              tier: "standard",
+              models: [{ slug: "claude-sonnet-5", name: "claude-sonnet-5" }],
+            }),
+          );
+          const claudeSlugs = status.models
+            .filter((candidate) => candidate.slug.startsWith("claude-"))
+            .map((candidate) => candidate.slug);
+          assert.deepStrictEqual(claudeSlugs, ["claude-sonnet-5"]);
+        }).pipe(Effect.provide(readyClaudeSpawner)),
+      );
+
+      it.effect("gives manual custom models the portable effort fallback on a gateway", () =>
+        Effect.gen(function* () {
+          const status = yield* checkClaudeProviderStatus(
+            decodeClaudeSettings({ customModels: ["my-proxy-model"] }),
+            claudeCapabilities(),
+            gatewayEnv,
+            discovery({ kind: "discovered", tier: "standard", models: [] }),
+          );
+          const custom = status.models.find((candidate) => candidate.slug === "my-proxy-model");
+          assert.strictEqual(custom?.isCustom, true);
+          const effort = custom?.capabilities?.optionDescriptors?.find(
+            (descriptor) => descriptor.type === "select" && descriptor.id === "effort",
+          );
+          assert.ok(effort, "expected portable effort fallback for a gateway custom model");
+        }).pipe(Effect.provide(readyClaudeSpawner)),
+      );
+
+      it.effect("degrades to warning and keeps static models when discovery fails", () =>
+        Effect.gen(function* () {
+          const status = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            claudeCapabilities(),
+            gatewayEnv,
+            discovery({ kind: "failed", host: "localhost:8317", detail: "request-failed" }),
+          );
+          assert.strictEqual(status.status, "warning");
+          assert.ok(status.message?.includes("localhost:8317"));
+          assert.ok(status.models.some((candidate) => candidate.slug === "claude-opus-4-8"));
+        }).pipe(Effect.provide(readyClaudeSpawner)),
+      );
+
+      it.effect("does not run discovery for a first-party Anthropic instance", () =>
+        Effect.gen(function* () {
+          const status = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            claudeCapabilities(),
+            {} as NodeJS.ProcessEnv,
+            () => Effect.die("discovery must not run without a custom gateway"),
+          );
+          assert.strictEqual(status.status, "ready");
+          assert.ok(status.models.some((candidate) => candidate.slug === "claude-opus-4-8"));
+        }).pipe(Effect.provide(readyClaudeSpawner)),
+      );
+
+      it.effect("skips discovery for a Bedrock-backed instance", () =>
+        Effect.gen(function* () {
+          const status = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            claudeCapabilities({ apiProvider: "bedrock" }),
+            gatewayEnv,
+            () => Effect.die("discovery must not run for Bedrock"),
+          );
+          assert.strictEqual(status.status, "ready");
+          assert.strictEqual(status.auth.type, "bedrock");
+        }).pipe(Effect.provide(readyClaudeSpawner)),
       );
     });
   },

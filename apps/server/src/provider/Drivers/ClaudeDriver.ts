@@ -12,7 +12,12 @@
  *
  * @module provider/Drivers/ClaudeDriver
  */
-import { ClaudeSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
+import {
+  ClaudeSettings,
+  type ModelCapabilities,
+  ProviderDriverKind,
+  type ServerProvider,
+} from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Duration from "effect/Duration";
 import * as Crypto from "effect/Crypto";
@@ -30,9 +35,15 @@ import { ProviderDriverError } from "../Errors.ts";
 import { makeClaudeAdapter } from "../Layers/ClaudeAdapter.ts";
 import {
   checkClaudeProviderStatus,
+  getClaudeModelCapabilities,
   makePendingClaudeProvider,
   probeClaudeCapabilities,
+  resolveClaudeModelCapabilitiesForInstance,
 } from "../Layers/ClaudeProvider.ts";
+import {
+  discoverClaudeGatewayModels,
+  resolveClaudeModelsEndpoint,
+} from "../Layers/ClaudeModelDiscovery.ts";
 import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
@@ -53,12 +64,18 @@ import {
   makeProviderSnapshotSettingsSource,
   type ProviderSnapshotSettings,
 } from "../providerUpdateSettings.ts";
-import { makeClaudeCapabilitiesCacheKey, makeClaudeContinuationGroupKey } from "./ClaudeHome.ts";
+import {
+  makeClaudeCapabilitiesCacheKey,
+  makeClaudeContinuationGroupKey,
+  mergeClaudeDiscoveryEnvironment,
+  readClaudeConfigDirAnthropicEnv,
+} from "./ClaudeHome.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 const SNAPSHOT_REFRESH_INTERVAL = Duration.minutes(5);
 const CAPABILITIES_PROBE_TTL = Duration.minutes(5);
+const MODEL_DISCOVERY_TTL = Duration.minutes(5);
 
 function isClaudeNativeCommandPath(commandPath: string): boolean {
   const normalized = normalizeCommandPath(commandPath);
@@ -119,11 +136,23 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
     Effect.gen(function* () {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const path = yield* Path.Path;
+      const fileSystem = yield* FileSystem.FileSystem;
       const { cwd } = yield* ServerConfig;
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
       const processEnv = mergeProviderInstanceEnvironment(environment);
+      // A gateway can be configured either through T3's per-instance environment
+      // (already in `processEnv`) or the Claude-Code way — an `env` block in the
+      // instance's `CLAUDE_CONFIG_DIR/settings.json`, which the CLI reads but
+      // T3's process never sees. Overlay the latter (process env wins) so model
+      // discovery detects the gateway in both cases.
+      const configDirEnvOverlay = yield* readClaudeConfigDirAnthropicEnv(config).pipe(
+        Effect.provideService(Path.Path, path),
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.orElseSucceed(() => ({}) as Record<string, string>),
+      );
+      const discoveryEnv = mergeClaudeDiscoveryEnvironment(processEnv, configDirEnvOverlay);
       const fallbackContinuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
         instanceId,
@@ -141,14 +170,6 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         continuationGroupKey,
       });
 
-      const adapterOptions = {
-        instanceId,
-        environment: processEnv,
-        ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
-      };
-      const adapter = yield* makeClaudeAdapter(effectiveConfig, adapterOptions);
-      const textGeneration = yield* makeClaudeTextGeneration(effectiveConfig, processEnv);
-
       // Per-instance capabilities cache: keyed on binary + resolved HOME so
       // account-specific probes never share auth metadata across instances.
       const capabilitiesProbeCache = yield* Cache.make({
@@ -161,10 +182,56 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
       });
       const capabilitiesCacheKey = yield* makeClaudeCapabilitiesCacheKey(effectiveConfig, cwd);
 
+      // A custom `ANTHROPIC_BASE_URL` (e.g. CLIProxyAPI) is the only trigger for
+      // gateway model discovery; first-party Anthropic and Bedrock instances
+      // never hit the network for a catalog. `discoveryEnv` includes any gateway
+      // env from the instance's CLAUDE_CONFIG_DIR settings.
+      const gatewayBacked = resolveClaudeModelsEndpoint(discoveryEnv.ANTHROPIC_BASE_URL) !== null;
+
+      // Per-instance discovery cache: keyed on the resolved gateway endpoint plus
+      // the same binary/HOME identity, never on credentials. HttpClient is
+      // provided into the lookup so consumers get a dependency-free effect.
+      const discoveryCache = yield* Cache.make({
+        capacity: 1,
+        timeToLive: MODEL_DISCOVERY_TTL,
+        lookup: (_key: string) =>
+          discoverClaudeGatewayModels({ environment: discoveryEnv, clientVersion: null }).pipe(
+            Effect.provideService(HttpClient.HttpClient, httpClient),
+          ),
+      });
+      const discoveryCacheKey = `${resolveClaudeModelsEndpoint(discoveryEnv.ANTHROPIC_BASE_URL)?.modelsUrl ?? ""}\0${capabilitiesCacheKey}`;
+
+      // Instance-aware capability resolver shared with the adapter and
+      // text-generation layers so runtime effort/context handling honors gateway
+      // models. Non-gateway instances short-circuit to the static built-in
+      // resolution without touching the discovery cache.
+      const resolveInstanceModelCapabilities = (
+        model: string | null | undefined,
+      ): Effect.Effect<ModelCapabilities> =>
+        gatewayBacked
+          ? Cache.get(discoveryCache, discoveryCacheKey).pipe(
+              Effect.map((discovery) =>
+                resolveClaudeModelCapabilitiesForInstance({ model, discovery, gatewayBacked }),
+              ),
+            )
+          : Effect.succeed(getClaudeModelCapabilities(model));
+
+      const adapterOptions = {
+        instanceId,
+        environment: processEnv,
+        resolveModelCapabilities: resolveInstanceModelCapabilities,
+        ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
+      };
+      const adapter = yield* makeClaudeAdapter(effectiveConfig, adapterOptions);
+      const textGeneration = yield* makeClaudeTextGeneration(effectiveConfig, processEnv, {
+        resolveModelCapabilities: resolveInstanceModelCapabilities,
+      });
+
       const checkProvider = checkClaudeProviderStatus(
         effectiveConfig,
         () => Cache.get(capabilitiesProbeCache, capabilitiesCacheKey),
-        processEnv,
+        discoveryEnv,
+        () => Cache.get(discoveryCache, discoveryCacheKey),
       ).pipe(
         Effect.map(stampIdentity),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
@@ -178,7 +245,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         streamSettings: snapshotSettings.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
         initialSnapshot: (settings) =>
-          makePendingClaudeProvider(settings.provider).pipe(Effect.map(stampIdentity)),
+          makePendingClaudeProvider(settings.provider, discoveryEnv).pipe(
+            Effect.map(stampIdentity),
+          ),
         checkProvider,
         enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
           enrichProviderSnapshotWithVersionAdvisory(snapshot, maintenanceCapabilities, {
