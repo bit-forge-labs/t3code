@@ -150,6 +150,62 @@ export const ServerProviderUpdateStatus = Schema.Literals([
 ]);
 export type ServerProviderUpdateStatus = typeof ServerProviderUpdateStatus.Type;
 
+/**
+ * Health of a single upstream provider/credential fronted by a CLIProxyAPI
+ * gateway, folded from the Management API's per-credential state.
+ *
+ *  - `ready` — in rotation, serving requests.
+ *  - `cooldown` — temporarily benched after an upstream 403/429/5xx.
+ *  - `disabled` — administratively disabled or otherwise unavailable.
+ *  - `unknown` — the gateway reported no recognizable status.
+ */
+export const ServerProviderUsageStatus = Schema.Literals([
+  "ready",
+  "cooldown",
+  "disabled",
+  "unknown",
+]);
+export type ServerProviderUsageStatus = typeof ServerProviderUsageStatus.Type;
+
+/**
+ * One subscription quota window for an account, e.g. Claude's rolling 5-hour and
+ * 7-day caps read from its own usage API. `usedPercentage` is 0..100 utilization;
+ * `resetsAt` is when the window rolls over.
+ */
+export const ServerProviderQuotaWindow = Schema.Struct({
+  label: TrimmedNonEmptyString,
+  usedPercentage: Schema.Number,
+  resetsAt: Schema.optional(IsoDateTime),
+});
+export type ServerProviderQuotaWindow = typeof ServerProviderQuotaWindow.Type;
+
+/**
+ * Usage for one upstream account behind the gateway. A CLIProxyAPI instance
+ * rotates across several of these; the whole set is surfaced so the UI can show
+ * limits for every account, not just the active one.
+ *
+ * `quotaWindows` carries the real subscription limits when the provider exposes a
+ * usage API (Claude's 5h/7-day today). `usedPercentage` is a generic single-quota
+ * fallback for providers that report one on `/auth-files`; when neither is
+ * available, consumers fall back to `status` + the request counts.
+ */
+export const ServerProviderUsageEntry = Schema.Struct({
+  provider: TrimmedNonEmptyString,
+  label: Schema.optional(TrimmedNonEmptyString),
+  status: ServerProviderUsageStatus,
+  usedPercentage: Schema.optional(Schema.Number),
+  successCount: Schema.optional(NonNegativeInt),
+  failedCount: Schema.optional(NonNegativeInt),
+  quotaWindows: Schema.optional(Schema.Array(ServerProviderQuotaWindow)),
+});
+export type ServerProviderUsageEntry = typeof ServerProviderUsageEntry.Type;
+
+export const ServerProviderUsage = Schema.Struct({
+  fetchedAt: IsoDateTime,
+  providers: Schema.Array(ServerProviderUsageEntry),
+});
+export type ServerProviderUsage = typeof ServerProviderUsage.Type;
+
 export const ServerProviderUpdateState = Schema.Struct({
   status: ServerProviderUpdateStatus,
   startedAt: Schema.NullOr(IsoDateTime),
@@ -195,6 +251,11 @@ export const ServerProvider = Schema.Struct({
   skills: Schema.Array(ServerProviderSkill).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   versionAdvisory: Schema.optionalKey(ServerProviderVersionAdvisory),
   updateState: Schema.optionalKey(ServerProviderUpdateState),
+  // Per-upstream-provider usage/limits, populated only for gateway-backed
+  // instances (e.g. Claude pointed at CLIProxyAPI) when a management key is
+  // configured. Best-effort and independent of model discovery: absent when the
+  // gateway is first-party, no management key is set, or the fetch failed.
+  usage: Schema.optionalKey(ServerProviderUsage),
 });
 export type ServerProvider = typeof ServerProvider.Type;
 
