@@ -1299,6 +1299,10 @@ export function resolveDesktopRuntimeDependencies(
   return resolveCatalogDependencies(runtimeDependencies, catalog, "apps/desktop");
 }
 
+// Fork's GitHub repository. Desktop update checks fall back to this when no
+// build-time repository is configured, so builds check this fork for updates.
+export const DEFAULT_DESKTOP_UPDATE_REPOSITORY = "bit-forge-labs/t3code";
+
 export const resolveGitHubPublishConfig = Effect.fn("resolveGitHubPublishConfig")(function* (
   updateChannel: "latest" | "nightly",
 ) {
@@ -1309,7 +1313,7 @@ export const resolveGitHubPublishConfig = Effect.fn("resolveGitHubPublishConfig"
   const rawRepo = (
     Option.getOrUndefined(env.updateRepository)?.trim() ||
     Option.getOrUndefined(env.githubRepository)?.trim() ||
-    ""
+    DEFAULT_DESKTOP_UPDATE_REPOSITORY
   ).trim();
   if (!rawRepo) return undefined;
 
@@ -1410,15 +1414,15 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   };
   const updateChannel = resolveDesktopUpdateChannel(version);
   const publishConfig = yield* resolveGitHubPublishConfig(updateChannel);
-  if (publishConfig) {
-    buildConfig.publish = [publishConfig];
-  } else if (mockUpdates) {
+  if (mockUpdates) {
     buildConfig.publish = [
       {
         provider: "generic",
         url: resolveMockUpdateServerUrl(mockUpdateServerPort),
       },
     ];
+  } else if (publishConfig) {
+    buildConfig.publish = [publishConfig];
   }
 
   if (platform === "mac") {

@@ -115,7 +115,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
           ConfigProvider.layer(
             ConfigProvider.fromEnv({
               env: {
-                T3CODE_DESKTOP_UPDATE_REPOSITORY: "pingdotgg/t3code",
+                T3CODE_DESKTOP_UPDATE_REPOSITORY: "bit-forge-labs/t3code",
               },
             }),
           ),
@@ -126,7 +126,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
           ConfigProvider.layer(
             ConfigProvider.fromEnv({
               env: {
-                GITHUB_REPOSITORY: "pingdotgg/t3code",
+                GITHUB_REPOSITORY: "bit-forge-labs/t3code",
               },
             }),
           ),
@@ -135,18 +135,31 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
 
       assert.deepStrictEqual(latestConfig, {
         provider: "github",
-        owner: "pingdotgg",
+        owner: "bit-forge-labs",
         repo: "t3code",
         releaseType: "release",
       });
       assert.deepStrictEqual(nightlyConfig, {
         provider: "github",
-        owner: "pingdotgg",
+        owner: "bit-forge-labs",
         repo: "t3code",
         releaseType: "prerelease",
         channel: "nightly",
       });
     }),
+  );
+
+  it.effect("defaults desktop publish config to the fork when no repository is configured", () =>
+    Effect.gen(function* () {
+      const config = yield* resolveGitHubPublishConfig("latest");
+
+      assert.deepStrictEqual(config, {
+        provider: "github",
+        owner: "bit-forge-labs",
+        repo: "t3code",
+        releaseType: "release",
+      });
+    }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
   );
 
   it("omits bundled workspace packages from staged desktop dependencies", () => {
