@@ -349,12 +349,7 @@ function selectedClaudeContextWindow(
   modelSelection: ModelSelection | undefined,
   caps?: ModelCapabilities,
 ): number | undefined {
-  switch (modelSelection?.model) {
-    case "claude-opus-4-8":
-    case "claude-opus-4-7":
-      return 1_000_000;
-  }
-
+  // An explicit context-window selection always wins.
   const optionValue = getModelSelectionStringOptionValue(modelSelection, "contextWindow");
   if (optionValue === "1m") {
     return 1_000_000;
@@ -362,16 +357,28 @@ function selectedClaudeContextWindow(
   if (optionValue === "200k") {
     return 200_000;
   }
+
+  // A gateway model reports its window as read-only metadata rather than a
+  // selectable option; prefer it over the built-in defaults below so a
+  // proxied same-named model isn't forced to a hardcoded window.
   const resolvedCaps = caps ?? getClaudeModelCapabilities(modelSelection?.model);
+  if (resolvedCaps.contextWindowTokens !== undefined) {
+    return resolvedCaps.contextWindowTokens;
+  }
+
+  switch (modelSelection?.model) {
+    case "claude-opus-4-8":
+    case "claude-opus-4-7":
+      return 1_000_000;
+  }
+
   const hasContextWindowOption = getProviderOptionDescriptors({ caps: resolvedCaps }).some(
     (descriptor) => descriptor.type === "select" && descriptor.id === "contextWindow",
   );
   if (hasContextWindowOption) {
     return 200_000;
   }
-  // A gateway model reports its window as read-only metadata rather than a
-  // selectable option; seed the initial context meter from it.
-  return resolvedCaps.contextWindowTokens;
+  return undefined;
 }
 
 function finiteNonNegativeInteger(value: unknown): number | undefined {

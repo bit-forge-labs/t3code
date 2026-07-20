@@ -222,9 +222,7 @@ function dedupeBySlug(
  * recognized-but-empty catalog still returns `{ models: [] }`. Returns `null`
  * only for an unrecognized envelope (neither `models` nor `data` array).
  */
-export function parseClaudeDiscoveryPayload(
-  payload: unknown,
-): {
+export function parseClaudeDiscoveryPayload(payload: unknown): {
   readonly tier: ClaudeModelDiscoveryTier;
   readonly models: ReadonlyArray<ClaudeDiscoveredModel>;
 } | null {
@@ -353,8 +351,12 @@ export const discoverClaudeGatewayModels = (input: {
       } satisfies ClaudeModelDiscoveryOutcome;
     }
 
+    // Report the terminal (fallback) attempt's cause: an unrecognized shape only
+    // when the standard request itself succeeded-but-unparseable, otherwise a
+    // request failure. Basing this on the expanded attempt misreported a failed
+    // fallback as "unrecognized-response".
     const detail =
-      Result.isSuccess(expanded) && expanded.success === null
+      Result.isSuccess(standard) && standard.success === null
         ? "unrecognized-response"
         : "request-failed";
     return { kind: "failed", host: endpoint.host, detail } satisfies ClaudeModelDiscoveryOutcome;

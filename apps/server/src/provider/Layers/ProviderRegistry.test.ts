@@ -2119,6 +2119,22 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         }).pipe(Effect.provide(readyClaudeSpawner)),
       );
 
+      it.effect("keeps the built-in catalog (not empty) when the gateway returns no models", () =>
+        Effect.gen(function* () {
+          const status = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            claudeCapabilities(),
+            gatewayEnv,
+            discovery({ kind: "discovered", tier: "standard", models: [] }),
+          );
+          // An empty-but-successful catalog must NOT wipe the model list — it
+          // degrades to the built-in/manual list with a warning.
+          assert.strictEqual(status.status, "warning");
+          assert.ok(status.message?.includes("no models"));
+          assert.ok(status.models.some((candidate) => candidate.slug === "claude-opus-4-8"));
+        }).pipe(Effect.provide(readyClaudeSpawner)),
+      );
+
       it.effect("does not run discovery for a first-party Anthropic instance", () =>
         Effect.gen(function* () {
           const status = yield* checkClaudeProviderStatus(

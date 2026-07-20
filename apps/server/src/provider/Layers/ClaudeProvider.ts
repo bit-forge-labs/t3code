@@ -1114,20 +1114,28 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
   // version-upgrade advisory.
   const discoveryEligible = gatewayBacked && capabilities.apiProvider !== "bedrock";
   const discovery = discoveryEligible && resolveDiscovery ? yield* resolveDiscovery() : undefined;
-  const discoverySucceeded = discovery?.kind === "discovered";
-  const discoveredModels = discoverySucceeded ? discovery.models : [];
+  // A recognized-but-empty gateway catalog is NOT treated as authoritative:
+  // wiping the whole model list on a transient/misconfigured empty response is
+  // worse than keeping the built-in/manual list. Only a non-empty catalog is
+  // authoritative; empty and failed responses both degrade to the fallback list
+  // with a warning.
+  const discoveredModels = discovery?.kind === "discovered" ? discovery.models : [];
+  const discoverySucceeded = discoveredModels.length > 0;
   const readyModels = buildClaudeModels(versionBuiltIns, discoveredModels, discoverySucceeded);
   const discoveryWarning =
     discovery?.kind === "failed"
       ? `Model discovery from the configured Claude gateway (${discovery.host}) failed; using the built-in and manually configured model list.`
-      : undefined;
+      : discovery?.kind === "discovered" && discovery.models.length === 0
+        ? "The configured Claude gateway returned no models; using the built-in and manually configured model list."
+        : undefined;
   const readyStatus = discoveryWarning ? "warning" : "ready";
-  // When the gateway catalog is authoritative, the first-party version-upgrade
-  // advisory (about built-in Claude models we no longer list) does not apply.
-  const readyMessage = discoverySucceeded
-    ? undefined
-    : [versionUpgradeMessage, discoveryWarning].filter((part) => Boolean(part)).join(" ") ||
-      undefined;
+  // Keep the first-party version-upgrade advisory even when a gateway catalog is
+  // authoritative: the gateway may proxy a real Claude model whose built-in
+  // capabilities the local CLI is too old to drive. Join with any discovery
+  // warning.
+  const readyMessage =
+    [versionUpgradeMessage, discoveryWarning].filter((part) => Boolean(part)).join(" ") ||
+    undefined;
 
   return buildServerProvider({
     presentation: CLAUDE_PRESENTATION,
