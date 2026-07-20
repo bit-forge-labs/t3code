@@ -13,7 +13,11 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
-import { type ClaudeSettings, type ModelSelection } from "@t3tools/contracts";
+import {
+  type ClaudeSettings,
+  type ModelCapabilities,
+  type ModelSelection,
+} from "@t3tools/contracts";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
@@ -61,9 +65,23 @@ const decodeClaudeOutputEnvelope = Schema.decodeEffect(Schema.fromJsonString(Cla
 export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(function* (
   claudeSettings: ClaudeSettings,
   environment?: NodeJS.ProcessEnv,
+  options?: {
+    /**
+     * Instance-aware model capability resolver shared with the adapter. When
+     * present, secondary text generation (commit/PR/branch/title) honors gateway
+     * model effort; when absent it falls back to static built-in resolution.
+     */
+    readonly resolveModelCapabilities?: (
+      model: string | null | undefined,
+    ) => Effect.Effect<ModelCapabilities>;
+  },
 ) {
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const claudeEnvironment = yield* makeClaudeEnvironment(claudeSettings, environment);
+  const resolveModelCapabilities = (
+    model: string | null | undefined,
+  ): Effect.Effect<ModelCapabilities> =>
+    options?.resolveModelCapabilities?.(model) ?? Effect.succeed(getClaudeModelCapabilities(model));
 
   const readStreamAsString = <E>(
     operation: string,
@@ -126,7 +144,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       toJsonSchemaObject(outputSchemaJson),
       "Failed to encode structured output schema.",
     );
-    const caps = getClaudeModelCapabilities(modelSelection.model);
+    const caps = yield* resolveModelCapabilities(modelSelection.model);
     const descriptors = getProviderOptionDescriptors({
       caps,
       selections: modelSelection.options,

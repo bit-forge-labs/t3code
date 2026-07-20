@@ -2,9 +2,96 @@ import * as NodeOS from "node:os";
 
 import type { ClaudeSettings } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
 import { expandHomePath } from "../../pathExpansion.ts";
+
+/**
+ * Anthropic env vars that a Claude Code `settings.json` `env` block may define
+ * to point the CLI at a custom gateway. T3's model discovery needs to see these
+ * even though they are configured for the CLI, not for T3's own process env.
+ */
+const DISCOVERY_RELEVANT_ENV_KEYS = [
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
+] as const;
+
+function extractAnthropicEnvOverlay(raw: string): Record<string, string> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  if (!parsed || typeof parsed !== "object") return {};
+  const env = (parsed as { readonly env?: unknown }).env;
+  if (!env || typeof env !== "object") return {};
+  const record = env as Record<string, unknown>;
+  const overlay: Record<string, string> = {};
+  for (const key of DISCOVERY_RELEVANT_ENV_KEYS) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim().length > 0) {
+      overlay[key] = value;
+    }
+  }
+  return overlay;
+}
+
+/**
+ * Read the Anthropic gateway env (`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
+ * / `ANTHROPIC_API_KEY`) from a Claude Code config directory's `settings.json`
+ * and `settings.local.json` `env` blocks, so an instance configured the
+ * Claude-Code way (a `CLAUDE_CONFIG_DIR` file rather than T3's own per-instance
+ * environment) is still discoverable. `settings.local.json` overrides
+ * `settings.json`. Missing or malformed files are ignored.
+ *
+ * The result is an *overlay* — the caller merges it under the real process env
+ * so explicit T3 / OS env always wins.
+ */
+export const readClaudeConfigDirAnthropicEnv = Effect.fn("readClaudeConfigDirAnthropicEnv")(
+  function* (
+    config: Pick<ClaudeSettings, "homePath">,
+  ): Effect.fn.Return<Record<string, string>, never, Path.Path | FileSystem.FileSystem> {
+    const path = yield* Path.Path;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const resolvedHomePath = yield* resolveClaudeHomePath(config);
+
+    const overlay: Record<string, string> = {};
+    // settings.json first, then settings.local.json (local overrides).
+    for (const fileName of ["settings.json", "settings.local.json"] as const) {
+      const filePath = path.join(resolvedHomePath, fileName);
+      const contents = yield* fileSystem
+        .readFileString(filePath)
+        .pipe(Effect.orElseSucceed(() => undefined));
+      if (contents !== undefined) {
+        Object.assign(overlay, extractAnthropicEnvOverlay(contents));
+      }
+    }
+    return overlay;
+  },
+);
+
+/**
+ * Merge a config-dir Anthropic env overlay under a base env: keys already
+ * present (non-empty) in the base env win, so explicit T3 / OS environment is
+ * never overridden by a `settings.json` value.
+ */
+export function mergeClaudeDiscoveryEnvironment(
+  baseEnv: NodeJS.ProcessEnv,
+  overlay: Record<string, string>,
+): NodeJS.ProcessEnv {
+  if (Object.keys(overlay).length === 0) return baseEnv;
+  const next: NodeJS.ProcessEnv = { ...baseEnv };
+  for (const [key, value] of Object.entries(overlay)) {
+    const existing = next[key]?.trim();
+    if (!existing) {
+      next[key] = value;
+    }
+  }
+  return next;
+}
 
 export const resolveClaudeHomePath = Effect.fn("resolveClaudeHomePath")(function* (
   config: Pick<ClaudeSettings, "homePath">,

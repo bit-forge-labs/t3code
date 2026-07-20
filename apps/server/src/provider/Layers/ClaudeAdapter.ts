@@ -27,6 +27,7 @@ import {
   type CanonicalRequestType,
   type ClaudeSettings,
   EventId,
+  type ModelCapabilities,
   type ProviderApprovalDecision,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -221,6 +222,15 @@ export interface ClaudeAdapterLiveOptions {
   }) => ClaudeQueryRuntime;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  /**
+   * Instance-aware model capability resolver. When present, runtime effort and
+   * context handling consults the gateway-discovered catalog (see
+   * {@link ../Drivers/ClaudeDriver.ts}); when absent (tests, non-driver
+   * callers), the adapter falls back to the static built-in resolution.
+   */
+  readonly resolveModelCapabilities?: (
+    model: string | null | undefined,
+  ) => Effect.Effect<ModelCapabilities>;
 }
 
 function isUuid(value: string): boolean {
@@ -337,13 +347,9 @@ function maxClaudeContextWindowFromModelUsage(
 
 function selectedClaudeContextWindow(
   modelSelection: ModelSelection | undefined,
+  caps?: ModelCapabilities,
 ): number | undefined {
-  switch (modelSelection?.model) {
-    case "claude-opus-4-8":
-    case "claude-opus-4-7":
-      return 1_000_000;
-  }
-
+  // An explicit context-window selection always wins.
   const optionValue = getModelSelectionStringOptionValue(modelSelection, "contextWindow");
   if (optionValue === "1m") {
     return 1_000_000;
@@ -351,8 +357,22 @@ function selectedClaudeContextWindow(
   if (optionValue === "200k") {
     return 200_000;
   }
-  const caps = getClaudeModelCapabilities(modelSelection?.model);
-  const hasContextWindowOption = getProviderOptionDescriptors({ caps }).some(
+
+  // A gateway model reports its window as read-only metadata rather than a
+  // selectable option; prefer it over the built-in defaults below so a
+  // proxied same-named model isn't forced to a hardcoded window.
+  const resolvedCaps = caps ?? getClaudeModelCapabilities(modelSelection?.model);
+  if (resolvedCaps.contextWindowTokens !== undefined) {
+    return resolvedCaps.contextWindowTokens;
+  }
+
+  switch (modelSelection?.model) {
+    case "claude-opus-4-8":
+    case "claude-opus-4-7":
+      return 1_000_000;
+  }
+
+  const hasContextWindowOption = getProviderOptionDescriptors({ caps: resolvedCaps }).some(
     (descriptor) => descriptor.type === "select" && descriptor.id === "contextWindow",
   );
   if (hasContextWindowOption) {
@@ -1341,6 +1361,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   options?: ClaudeAdapterLiveOptions,
 ) {
   const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("claudeAgent");
+  const resolveModelCapabilities = (
+    model: string | null | undefined,
+  ): Effect.Effect<ModelCapabilities> =>
+    options?.resolveModelCapabilities?.(model) ?? Effect.succeed(getClaudeModelCapabilities(model));
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const serverConfig = yield* ServerConfig;
@@ -3414,10 +3438,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const extraArgs = parseCliArgs(claudeSettings.launchArgs).flags;
       const modelSelection =
         input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
-      const caps = getClaudeModelCapabilities(modelSelection?.model);
+      const caps = yield* resolveModelCapabilities(modelSelection?.model);
       const descriptors = getProviderOptionDescriptors({ caps });
       const apiModelId = modelSelection ? resolveClaudeApiModelId(modelSelection) : undefined;
-      const initialContextWindow = selectedClaudeContextWindow(modelSelection);
+      const initialContextWindow = selectedClaudeContextWindow(modelSelection, caps);
       const rawEffort = getModelSelectionStringOptionValue(modelSelection, "effort");
       const effort = resolveClaudeEffort(caps, rawEffort) ?? null;
       const fastModeSupported = descriptors.some(

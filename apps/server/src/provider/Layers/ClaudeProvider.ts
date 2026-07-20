@@ -16,6 +16,7 @@ import {
   getModelSelectionStringOptionValue,
   getProviderOptionCurrentValue,
   getProviderOptionDescriptors,
+  normalizeCustomModelSlug,
 } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { compareSemverVersions } from "@t3tools/shared/semver";
@@ -32,16 +33,155 @@ import {
   DEFAULT_TIMEOUT_MS,
   isCommandMissingCause,
   parseGenericCliVersion,
-  providerModelsFromSettings,
   spawnAndCollect,
   type ServerProviderDraft,
 } from "../providerSnapshot.ts";
 import { resolveClaudeSdkExecutablePath } from "../Drivers/ClaudeExecutable.ts";
 import { makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
+import {
+  resolveClaudeModelsEndpoint,
+  type ClaudeDiscoveredModel,
+  type ClaudeModelDiscoveryOutcome,
+} from "./ClaudeModelDiscovery.ts";
 
 const DEFAULT_CLAUDE_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
   optionDescriptors: [],
 });
+
+/**
+ * Portable effort levels for models discovered from a custom gateway that
+ * advertises reasoning support without enumerating specific levels, and for
+ * manually configured proxy models. Deliberately excludes Claude-only controls
+ * (`fastMode`, `thinking`) and prompt-injected modes (`ultrathink`,
+ * `ultracode`) that do not translate to arbitrary upstream providers.
+ */
+const CLAUDE_PROXY_EFFORT_CAPABILITIES: ModelCapabilities = createModelCapabilities({
+  optionDescriptors: [
+    buildSelectOptionDescriptor({
+      id: "effort",
+      label: "Reasoning",
+      options: [
+        { value: "low", label: "Low" },
+        { value: "medium", label: "Medium" },
+        { value: "high", label: "High", isDefault: true },
+        { value: "max", label: "Max" },
+      ],
+    }),
+  ],
+});
+
+/** Friendly labels for known reasoning-effort values; others are title-cased. */
+function claudeEffortLabel(value: string): string {
+  switch (value.toLowerCase()) {
+    case "minimal":
+      return "Minimal";
+    case "none":
+      return "None";
+    case "low":
+      return "Low";
+    case "medium":
+      return "Medium";
+    case "high":
+      return "High";
+    case "xhigh":
+      return "Extra High";
+    case "max":
+      return "Max";
+    case "ultra":
+      return "Ultra";
+    case "auto":
+      return "Auto";
+    default:
+      return toTitleCaseWords(value);
+  }
+}
+
+/**
+ * Build capabilities for a model discovered from a custom gateway. Effort
+ * controls come from the gateway's advertised reasoning levels; context limits
+ * are attached as read-only metadata. Models discovered without reasoning levels
+ * (the minimal `/v1/models` tier) fall back to the portable effort set only when
+ * the instance is gateway-backed, otherwise remain capability-empty.
+ */
+function buildDiscoveredClaudeModelCapabilities(
+  discovered: ClaudeDiscoveredModel,
+  gatewayBacked: boolean,
+): ModelCapabilities {
+  const optionDescriptors =
+    discovered.effortLevels && discovered.effortLevels.length > 0
+      ? [
+          buildSelectOptionDescriptor({
+            id: "effort",
+            label: "Reasoning",
+            options: discovered.effortLevels.map((level) => ({
+              value: level.value,
+              label: claudeEffortLabel(level.value),
+              ...(level.description ? { description: level.description } : {}),
+              ...(level.isDefault ? { isDefault: true } : {}),
+            })),
+          }),
+        ]
+      : gatewayBacked
+        ? [...(CLAUDE_PROXY_EFFORT_CAPABILITIES.optionDescriptors ?? [])]
+        : [];
+
+  return createModelCapabilities({
+    optionDescriptors,
+    ...(discovered.contextWindowTokens !== undefined
+      ? { contextWindowTokens: discovered.contextWindowTokens }
+      : {}),
+    ...(discovered.maxContextWindowTokens !== undefined
+      ? { maxContextWindowTokens: discovered.maxContextWindowTokens }
+      : {}),
+  });
+}
+
+/**
+ * Augment a built-in Claude model with read-only context metadata (and, when the
+ * gateway advertises them, replaced effort levels) from its discovered twin,
+ * without disturbing the model's tested static controls or ordering.
+ */
+function augmentBuiltInWithDiscovery(
+  builtIn: ServerProviderModel,
+  discovered: ClaudeDiscoveredModel,
+): ServerProviderModel {
+  const baseCaps = builtIn.capabilities ?? DEFAULT_CLAUDE_MODEL_CAPABILITIES;
+  const baseDescriptors = baseCaps.optionDescriptors ?? [];
+  const descriptors =
+    discovered.effortLevels && discovered.effortLevels.length > 0
+      ? baseDescriptors.map((descriptor) =>
+          descriptor.type === "select" && descriptor.id === "effort"
+            ? buildSelectOptionDescriptor({
+                id: "effort",
+                label: descriptor.label,
+                options: discovered.effortLevels!.map((level) => ({
+                  value: level.value,
+                  label: claudeEffortLabel(level.value),
+                  ...(level.description ? { description: level.description } : {}),
+                  ...(level.isDefault ? { isDefault: true } : {}),
+                })),
+                ...(descriptor.promptInjectedValues
+                  ? { promptInjectedValues: [...descriptor.promptInjectedValues] }
+                  : {}),
+              })
+            : descriptor,
+        )
+      : baseDescriptors;
+
+  return {
+    ...builtIn,
+    ...(discovered.description ? { description: discovered.description } : {}),
+    capabilities: createModelCapabilities({
+      optionDescriptors: descriptors,
+      ...(discovered.contextWindowTokens !== undefined
+        ? { contextWindowTokens: discovered.contextWindowTokens }
+        : {}),
+      ...(discovered.maxContextWindowTokens !== undefined
+        ? { maxContextWindowTokens: discovered.maxContextWindowTokens }
+        : {}),
+    }),
+  };
+}
 
 const CLAUDE_PRESENTATION = {
   displayName: "Claude",
@@ -310,12 +450,140 @@ function formatClaudeOpus47UpgradeMessage(version: string | null): string {
   return `Claude Code ${versionLabel} is too old for Claude Opus 4.7. Upgrade to v${MINIMUM_CLAUDE_OPUS_4_7_VERSION} or newer to access it.`;
 }
 
-export function getClaudeModelCapabilities(model: string | null | undefined): ModelCapabilities {
+/**
+ * Resolve capabilities for a Claude model slug. Resolution order:
+ *   1. Exact built-in Claude model capabilities.
+ *   2. Caller-supplied instance fallback (e.g. portable proxy effort for a
+ *      gateway-backed instance).
+ *   3. Empty capabilities.
+ */
+export function getClaudeModelCapabilities(
+  model: string | null | undefined,
+  fallbackCapabilities: ModelCapabilities = DEFAULT_CLAUDE_MODEL_CAPABILITIES,
+): ModelCapabilities {
   const slug = model?.trim();
   return (
     BUILT_IN_MODELS.find((candidate) => candidate.slug === slug)?.capabilities ??
-    DEFAULT_CLAUDE_MODEL_CAPABILITIES
+    fallbackCapabilities
   );
+}
+
+/** The portable effort capabilities used for unknown models on a gateway. */
+export function claudeProxyEffortCapabilities(): ModelCapabilities {
+  return CLAUDE_PROXY_EFFORT_CAPABILITIES;
+}
+
+/**
+ * Merge built-ins, gateway-discovered models, and manually configured custom
+ * models into a single ordered, de-duplicated catalog.
+ *
+ * When `discoverySucceeded` is true the gateway's catalog is **authoritative**:
+ * only models the proxy actually reports are listed — a built-in `claude-*`
+ * model that the proxy does not serve is never shown, since the static allowlist
+ * is a first-party assumption that does not hold behind an arbitrary gateway.
+ * Discovered models matching a built-in keep the built-in's tested capabilities
+ * (augmented with discovered metadata); the rest use discovered/portable caps.
+ *
+ * When `discoverySucceeded` is false (no gateway, or discovery failed/again
+ * pending) the static built-in catalog is shown as the fallback.
+ *
+ * Ordering: built-in models the proxy serves (canonical order) → remaining
+ * discovered models (gateway order) → manual custom models (settings order).
+ * Manual entries duplicating an existing slug are dropped; manual models on a
+ * gateway-backed instance receive the portable effort fallback.
+ */
+export function mergeClaudeModelsWithDiscovery(input: {
+  readonly builtInModels: ReadonlyArray<ServerProviderModel>;
+  readonly discoveredModels: ReadonlyArray<ClaudeDiscoveredModel>;
+  readonly customModels: ReadonlyArray<string>;
+  readonly gatewayBacked: boolean;
+  readonly discoverySucceeded: boolean;
+}): ReadonlyArray<ServerProviderModel> {
+  const builtInBySlug = new Map(input.builtInModels.map((model) => [model.slug, model]));
+  const discoveredBySlug = new Map(input.discoveredModels.map((model) => [model.slug, model]));
+
+  const merged: Array<ServerProviderModel> = [];
+  const seen = new Set<string>();
+
+  if (input.discoverySucceeded) {
+    // Authoritative gateway catalog. Built-ins the proxy actually serves first
+    // (canonical order, augmented), then the rest of the discovered models.
+    for (const builtIn of input.builtInModels) {
+      const discovered = discoveredBySlug.get(builtIn.slug);
+      if (discovered) {
+        seen.add(builtIn.slug);
+        merged.push(augmentBuiltInWithDiscovery(builtIn, discovered));
+      }
+    }
+    for (const discovered of input.discoveredModels) {
+      if (seen.has(discovered.slug) || builtInBySlug.has(discovered.slug)) {
+        continue;
+      }
+      seen.add(discovered.slug);
+      merged.push({
+        slug: discovered.slug,
+        name: discovered.name,
+        ...(discovered.description ? { description: discovered.description } : {}),
+        isCustom: false,
+        capabilities: buildDiscoveredClaudeModelCapabilities(discovered, input.gatewayBacked),
+      });
+    }
+  } else {
+    // No gateway, or discovery failed / not yet run: static built-in catalog.
+    for (const builtIn of input.builtInModels) {
+      seen.add(builtIn.slug);
+      merged.push(builtIn);
+    }
+  }
+
+  // Manual custom models not already present.
+  const manualCapabilities = input.gatewayBacked
+    ? CLAUDE_PROXY_EFFORT_CAPABILITIES
+    : DEFAULT_CLAUDE_MODEL_CAPABILITIES;
+  for (const candidate of input.customModels) {
+    // Custom slugs are provider-owned: trim only, never alias-expand (matches
+    // upstream `providerModelsFromSettings` / "preserve custom model slugs").
+    const normalized = normalizeCustomModelSlug(candidate);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    merged.push({
+      slug: normalized,
+      name: normalized,
+      isCustom: true,
+      capabilities: manualCapabilities,
+    });
+  }
+
+  return merged;
+}
+
+/**
+ * Resolve instance-aware capabilities for a model at runtime, consulting a
+ * discovery outcome for gateway models. Built-ins always win; discovered models
+ * use their advertised effort/context; unknown models fall back to the portable
+ * proxy set on a gateway-backed instance, else empty.
+ */
+export function resolveClaudeModelCapabilitiesForInstance(input: {
+  readonly model: string | null | undefined;
+  readonly discovery: ClaudeModelDiscoveryOutcome | undefined;
+  readonly gatewayBacked: boolean;
+}): ModelCapabilities {
+  const slug = input.model?.trim();
+  const builtIn = slug ? BUILT_IN_MODELS.find((candidate) => candidate.slug === slug) : undefined;
+  if (builtIn) {
+    return builtIn.capabilities ?? DEFAULT_CLAUDE_MODEL_CAPABILITIES;
+  }
+
+  if (slug && input.discovery?.kind === "discovered") {
+    const discovered = input.discovery.models.find((candidate) => candidate.slug === slug);
+    if (discovered) {
+      return buildDiscoveredClaudeModelCapabilities(discovered, input.gatewayBacked);
+    }
+  }
+
+  return input.gatewayBacked ? CLAUDE_PROXY_EFFORT_CAPABILITIES : DEFAULT_CLAUDE_MODEL_CAPABILITIES;
 }
 
 export function resolveClaudeEffort(
@@ -369,13 +637,25 @@ export function isClaudeUltracodeEffort(effort: string | null | undefined): bool
   return effort === "ultracode";
 }
 
+/** Whether a slug is a built-in (first-party Anthropic) Claude model. */
+export function isBuiltInClaudeModel(model: string | null | undefined): boolean {
+  const slug = model?.trim();
+  return slug ? BUILT_IN_MODELS.some((candidate) => candidate.slug === slug) : false;
+}
+
 export function resolveClaudeApiModelId(modelSelection: ModelSelection): string {
-  switch (getModelSelectionStringOptionValue(modelSelection, "contextWindow")) {
-    case "1m":
-      return `${modelSelection.model}[1m]`;
-    default:
-      return modelSelection.model;
+  // The `[1m]` context-window suffix is Claude Code routing syntax and must only
+  // be applied to first-party Claude models. A discovered gateway model never
+  // exposes a selectable context option, but a stale stored selection could
+  // still carry `contextWindow: "1m"` — guard against appending it to a
+  // non-Anthropic model id.
+  if (
+    isBuiltInClaudeModel(modelSelection.model) &&
+    getModelSelectionStringOptionValue(modelSelection, "contextWindow") === "1m"
+  ) {
+    return `${modelSelection.model}[1m]`;
   }
+  return modelSelection.model;
 }
 
 function toTitleCaseWords(value: string): string {
@@ -680,18 +960,29 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
     claudeSettings: ClaudeSettings,
   ) => Effect.Effect<ClaudeCapabilitiesProbe | undefined>,
   environment?: NodeJS.ProcessEnv,
+  resolveDiscovery?: () => Effect.Effect<ClaudeModelDiscoveryOutcome>,
 ): Effect.fn.Return<
   ServerProviderDraft,
   never,
   ChildProcessSpawner.ChildProcessSpawner | Path.Path
 > {
   const resolvedEnvironment = environment ?? process.env;
+  const gatewayBacked =
+    resolveClaudeModelsEndpoint(resolvedEnvironment.ANTHROPIC_BASE_URL) !== null;
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
-  const allModels = providerModelsFromSettings(
-    BUILT_IN_MODELS,
-    claudeSettings.customModels,
-    DEFAULT_CLAUDE_MODEL_CAPABILITIES,
-  );
+  const buildClaudeModels = (
+    builtInModels: ReadonlyArray<ServerProviderModel>,
+    discoveredModels: ReadonlyArray<ClaudeDiscoveredModel>,
+    discoverySucceeded: boolean,
+  ): ReadonlyArray<ServerProviderModel> =>
+    mergeClaudeModelsWithDiscovery({
+      builtInModels,
+      discoveredModels,
+      customModels: claudeSettings.customModels,
+      gatewayBacked,
+      discoverySucceeded,
+    });
+  const allModels = buildClaudeModels(BUILT_IN_MODELS, [], false);
 
   if (!claudeSettings.enabled) {
     return buildServerProvider({
@@ -777,11 +1068,8 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
     });
   }
 
-  const models = providerModelsFromSettings(
-    getBuiltInClaudeModelsForVersion(parsedVersion),
-    claudeSettings.customModels,
-    DEFAULT_CLAUDE_MODEL_CAPABILITIES,
-  );
+  const versionBuiltIns = getBuiltInClaudeModelsForVersion(parsedVersion);
+  const models = buildClaudeModels(versionBuiltIns, [], false);
   const versionUpgradeMessage = supportsClaudeFable5(parsedVersion)
     ? undefined
     : supportsClaudeOpus48(parsedVersion)
@@ -818,22 +1106,53 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
       subscriptionType: capabilities.subscriptionType,
       authMethod: capabilities.tokenSource,
     }) ?? apiProviderAuthMetadata(capabilities.apiProvider);
+
+  // Model discovery only applies to a custom gateway (not first-party Anthropic
+  // or Bedrock, which authenticates via external AWS creds and serves only
+  // Anthropic models). A discovery failure keeps the built-in/manual catalog and
+  // downgrades an otherwise-ready snapshot to `warning`, but never overrides the
+  // version-upgrade advisory.
+  const discoveryEligible = gatewayBacked && capabilities.apiProvider !== "bedrock";
+  const discovery = discoveryEligible && resolveDiscovery ? yield* resolveDiscovery() : undefined;
+  // A recognized-but-empty gateway catalog is NOT treated as authoritative:
+  // wiping the whole model list on a transient/misconfigured empty response is
+  // worse than keeping the built-in/manual list. Only a non-empty catalog is
+  // authoritative; empty and failed responses both degrade to the fallback list
+  // with a warning.
+  const discoveredModels = discovery?.kind === "discovered" ? discovery.models : [];
+  const discoverySucceeded = discoveredModels.length > 0;
+  const readyModels = buildClaudeModels(versionBuiltIns, discoveredModels, discoverySucceeded);
+  const discoveryWarning =
+    discovery?.kind === "failed"
+      ? `Model discovery from the configured Claude gateway (${discovery.host}) failed; using the built-in and manually configured model list.`
+      : discovery?.kind === "discovered" && discovery.models.length === 0
+        ? "The configured Claude gateway returned no models; using the built-in and manually configured model list."
+        : undefined;
+  const readyStatus = discoveryWarning ? "warning" : "ready";
+  // Keep the first-party version-upgrade advisory even when a gateway catalog is
+  // authoritative: the gateway may proxy a real Claude model whose built-in
+  // capabilities the local CLI is too old to drive. Join with any discovery
+  // warning.
+  const readyMessage =
+    [versionUpgradeMessage, discoveryWarning].filter((part) => Boolean(part)).join(" ") ||
+    undefined;
+
   return buildServerProvider({
     presentation: CLAUDE_PRESENTATION,
     enabled: claudeSettings.enabled,
     checkedAt,
-    models,
+    models: readyModels,
     slashCommands: dedupedSlashCommands,
     probe: {
       installed: true,
       version: parsedVersion,
-      status: "ready",
+      status: readyStatus,
       auth: {
         status: "authenticated",
         ...(capabilities.email ? { email: capabilities.email } : {}),
         ...(authMetadata ? authMetadata : {}),
       },
-      ...(versionUpgradeMessage ? { message: versionUpgradeMessage } : {}),
+      ...(readyMessage ? { message: readyMessage } : {}),
     },
   });
 });
@@ -842,14 +1161,23 @@ const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 export const makePendingClaudeProvider = (
   claudeSettings: ClaudeSettings,
+  environment?: NodeJS.ProcessEnv,
 ): Effect.Effect<ServerProviderDraft> =>
   Effect.gen(function* () {
     const checkedAt = yield* nowIso;
-    const models = providerModelsFromSettings(
-      BUILT_IN_MODELS,
-      claudeSettings.customModels,
-      DEFAULT_CLAUDE_MODEL_CAPABILITIES,
-    );
+    const gatewayBacked =
+      resolveClaudeModelsEndpoint((environment ?? process.env).ANTHROPIC_BASE_URL) !== null;
+    // A gateway instance's catalog is authoritative once discovered; don't flash
+    // the static built-in Claude list before the first refresh completes. Treat
+    // it as authoritative-but-empty here so only manual custom models show until
+    // discovery runs. Non-gateway instances show the built-in catalog.
+    const models = mergeClaudeModelsWithDiscovery({
+      builtInModels: BUILT_IN_MODELS,
+      discoveredModels: [],
+      customModels: claudeSettings.customModels,
+      gatewayBacked,
+      discoverySucceeded: gatewayBacked,
+    });
 
     if (!claudeSettings.enabled) {
       return buildServerProvider({
