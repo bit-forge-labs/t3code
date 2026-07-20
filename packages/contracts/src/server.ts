@@ -63,6 +63,12 @@ export const ServerProviderModel = Schema.Struct({
   name: TrimmedNonEmptyString,
   shortName: Schema.optional(TrimmedNonEmptyString),
   subProvider: Schema.optional(TrimmedNonEmptyString),
+  /**
+   * Optional human-readable model description reported by a provider catalog
+   * (e.g. a CLIProxyAPI gateway). Informational only; absent for models whose
+   * provider does not report one.
+   */
+  description: Schema.optional(TrimmedNonEmptyString),
   isCustom: Schema.Boolean,
   capabilities: Schema.NullOr(ModelCapabilities),
 });

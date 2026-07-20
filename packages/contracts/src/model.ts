@@ -1,7 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
-import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ProviderDriverKind } from "./providerInstance.ts";
 
 export const ProviderOptionDescriptorType = Schema.Literals(["select", "boolean"]);
@@ -124,6 +124,20 @@ function canonicalSelectionsToLegacyObject(
 
 export const ModelCapabilities = Schema.Struct({
   optionDescriptors: Schema.optional(Schema.Array(ProviderOptionDescriptor)),
+  /**
+   * Read-only context-window size (in tokens) reported by the provider for this
+   * model. Informational only — it seeds the initial context meter and is not a
+   * user-selectable option. Discovered from provider catalogs (e.g. a
+   * CLIProxyAPI gateway); absent for models whose provider does not report it.
+   */
+  contextWindowTokens: Schema.optional(PositiveInt),
+  /**
+   * Read-only maximum context-window ceiling (in tokens) reported by the
+   * provider, when it advertises a larger cap distinct from
+   * {@link contextWindowTokens}. Informational only; never substituted for the
+   * active context window.
+   */
+  maxContextWindowTokens: Schema.optional(PositiveInt),
 });
 export type ModelCapabilities = typeof ModelCapabilities.Type;
 
