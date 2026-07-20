@@ -9,6 +9,7 @@ import type {
   RuntimeMode,
   ScopedThreadRef,
   ServerProvider,
+  ServerProviderUsage,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -346,6 +347,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   compact: boolean;
   activeContextWindow: ReturnType<typeof deriveLatestContextWindowSnapshot>;
   activeThreadProviderDisplayName: string | null;
+  activeThreadProviderUsage: ServerProviderUsage | null;
   isPreparingWorktree: boolean;
   pendingAction: {
     questionIndex: number;
@@ -368,10 +370,11 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
 }) {
   return (
     <>
-      {props.activeContextWindow ? (
+      {props.activeContextWindow || (props.activeThreadProviderUsage?.providers.length ?? 0) > 0 ? (
         <ContextWindowMeter
           usage={props.activeContextWindow}
           providerDisplayName={props.activeThreadProviderDisplayName}
+          providerUsage={props.activeThreadProviderUsage}
         />
       ) : null}
       {props.isPreparingWorktree ? (
@@ -871,16 +874,28 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     () => deriveLatestContextWindowSnapshot(activeThreadActivities ?? []),
     [activeThreadActivities],
   );
+  const activeThreadProviderEntry = useMemo(
+    () =>
+      activeThreadModelSelection
+        ? (providerStatuses.find((p) => p.instanceId === activeThreadModelSelection.instanceId) ??
+          null)
+        : null,
+    [providerStatuses, activeThreadModelSelection],
+  );
   const activeThreadProviderDisplayName = useMemo(() => {
     if (!activeThreadModelSelection) return null;
-    const entry = providerStatuses.find(
-      (p) => p.instanceId === activeThreadModelSelection.instanceId,
-    );
-    if (entry) {
-      return getProviderDisplayName(providerStatuses, entry.driver);
+    if (activeThreadProviderEntry) {
+      return getProviderDisplayName(providerStatuses, activeThreadProviderEntry.driver);
     }
     return formatProviderDisplayName(activeThreadModelSelection.instanceId);
-  }, [providerStatuses, activeThreadModelSelection]);
+  }, [providerStatuses, activeThreadModelSelection, activeThreadProviderEntry]);
+  // Per-upstream-provider usage for the active thread's gateway instance (e.g. a
+  // Claude instance fronting several providers via CLIProxyAPI). Falls back to
+  // the composer's currently-selected instance so usage is visible before the
+  // thread has an active model selection (a fresh thread). Absent for instances
+  // without a configured management key or a first-party endpoint.
+  const activeThreadProviderUsage =
+    activeThreadProviderEntry?.usage ?? selectedProviderEntry?.snapshot?.usage ?? null;
 
   // ------------------------------------------------------------------
   // Composer-local state
@@ -2629,6 +2644,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   compact={isComposerPrimaryActionsCompact}
                   activeContextWindow={activeContextWindow}
                   activeThreadProviderDisplayName={activeThreadProviderDisplayName}
+                  activeThreadProviderUsage={activeThreadProviderUsage}
                   pendingAction={pendingPrimaryAction}
                   isRunning={phase === "running"}
                   showPlanFollowUpPrompt={pendingUserInputs.length === 0 && showPlanFollowUpPrompt}

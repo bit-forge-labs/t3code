@@ -33,6 +33,8 @@ import { HttpClient } from "effect/unstable/http";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 
+import { isRecord, positiveInt, trimmedNonEmpty } from "./gatewayPayload.ts";
+
 /**
  * Opaque failure for a single catalog request. Deliberately carries no cause
  * detail — the transport error may reference credential-bearing request data,
@@ -135,22 +137,6 @@ export function resolveClaudeModelsEndpoint(
 }
 
 // ── Payload parsing (pure) ──────────────────────────────────────────
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function trimmedNonEmpty(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function positiveInt(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
-  const rounded = Math.round(value);
-  return rounded >= 1 ? rounded : undefined;
-}
 
 function parseExpandedEffortLevels(
   entry: Record<string, unknown>,

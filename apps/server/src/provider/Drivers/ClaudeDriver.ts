@@ -44,6 +44,10 @@ import {
   discoverClaudeGatewayModels,
   resolveClaudeModelsEndpoint,
 } from "../Layers/ClaudeModelDiscovery.ts";
+import {
+  fetchCliProxyProviderUsage,
+  resolveCliProxyManagementEndpoint,
+} from "../Layers/CliProxyUsageDiscovery.ts";
 import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
@@ -76,6 +80,9 @@ const DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 const SNAPSHOT_REFRESH_INTERVAL = Duration.minutes(5);
 const CAPABILITIES_PROBE_TTL = Duration.minutes(5);
 const MODEL_DISCOVERY_TTL = Duration.minutes(5);
+// Usage buckets from CLIProxyAPI move on the order of minutes (10-min windows),
+// so a short TTL keeps the popover fresh without hammering the Management API.
+const USAGE_DISCOVERY_TTL = Duration.minutes(1);
 
 function isClaudeNativeCommandPath(commandPath: string): boolean {
   const normalized = normalizeCommandPath(commandPath);
@@ -201,6 +208,20 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
       });
       const discoveryCacheKey = `${resolveClaudeModelsEndpoint(discoveryEnv.ANTHROPIC_BASE_URL)?.modelsUrl ?? ""}\0${capabilitiesCacheKey}`;
 
+      // Per-instance usage cache: keyed on the resolved Management API endpoint
+      // plus the same binary/HOME identity, never on credentials. Populated only
+      // for gateway-backed instances; the fetch itself no-ops (ineligible) when
+      // no management key is configured.
+      const usageCache = yield* Cache.make({
+        capacity: 1,
+        timeToLive: USAGE_DISCOVERY_TTL,
+        lookup: (_key: string) =>
+          fetchCliProxyProviderUsage({ environment: discoveryEnv }).pipe(
+            Effect.provideService(HttpClient.HttpClient, httpClient),
+          ),
+      });
+      const usageCacheKey = `${resolveCliProxyManagementEndpoint(discoveryEnv.ANTHROPIC_BASE_URL)?.managementBaseUrl ?? ""}\0${capabilitiesCacheKey}`;
+
       // Instance-aware capability resolver shared with the adapter and
       // text-generation layers so runtime effort/context handling honors gateway
       // models. Non-gateway instances short-circuit to the static built-in
@@ -232,6 +253,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         () => Cache.get(capabilitiesProbeCache, capabilitiesCacheKey),
         discoveryEnv,
         () => Cache.get(discoveryCache, discoveryCacheKey),
+        () => Cache.get(usageCache, usageCacheKey),
       ).pipe(
         Effect.map(stampIdentity),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),

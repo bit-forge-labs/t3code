@@ -8,14 +8,21 @@ import * as Path from "effect/Path";
 import { expandHomePath } from "../../pathExpansion.ts";
 
 /**
- * Anthropic env vars that a Claude Code `settings.json` `env` block may define
- * to point the CLI at a custom gateway. T3's model discovery needs to see these
- * even though they are configured for the CLI, not for T3's own process env.
+ * Env vars that a Claude Code `settings.json` `env` block may define to point
+ * the CLI at a custom gateway. T3's model discovery and provider-usage lookups
+ * need to see these even though they are configured for the CLI, not for T3's
+ * own process env.
+ *
+ * `CLIPROXY_MANAGEMENT_KEY` is T3-specific: it authenticates the optional
+ * CLIProxyAPI Management API call that surfaces per-provider usage limits. It is
+ * ignored by Claude Code itself but read here from the same `env` block for
+ * configuration parity with the gateway settings.
  */
 const DISCOVERY_RELEVANT_ENV_KEYS = [
   "ANTHROPIC_BASE_URL",
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_API_KEY",
+  "CLIPROXY_MANAGEMENT_KEY",
 ] as const;
 
 function extractAnthropicEnvOverlay(raw: string): Record<string, string> {
