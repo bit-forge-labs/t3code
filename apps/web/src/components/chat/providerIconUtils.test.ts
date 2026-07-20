@@ -30,8 +30,17 @@ describe("resolveModelServiceIcon", () => {
   });
 
   it("does not misclassify look-alike tokens", () => {
-    // `opus` must not match the o1–o4 OpenAI series.
+    // `opus` must not match the OpenAI o-series.
     expect(resolveModelServiceIcon({ slug: "claude-opus-4-8", driverKind: cursor })).toBe(ClaudeAI);
+    // `o2` was never an OpenAI model, and an embedded `o3` must not match.
+    expect(resolveModelServiceIcon({ slug: "o2-turbo", driverKind: cursor })).toBe(CursorIcon);
+    expect(resolveModelServiceIcon({ slug: "o3corp-llm", driverKind: cursor })).toBe(CursorIcon);
+  });
+
+  it("still attributes the real OpenAI o-series (o1/o3/o4) to OpenAI", () => {
+    for (const slug of ["o1", "o1-preview", "o3-mini", "o4-mini"]) {
+      expect(resolveModelServiceIcon({ slug, driverKind: cursor })).toBe(OpenAI);
+    }
   });
 
   it("falls back to the provider driver icon for unknown vendors", () => {

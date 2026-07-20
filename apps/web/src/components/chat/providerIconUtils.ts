@@ -18,14 +18,17 @@ export const PROVIDER_ICON_BY_PROVIDER: Partial<Record<ProviderDriverKind, Icon>
  * OpenCode — where a single instance serves models from many vendors.
  *
  * Each token must sit on a boundary (start, or after `/ . _ -` / whitespace) so
- * `opus` never matches the `o1`–`o4` OpenAI series and `command` never matches
- * a substring. Order matters: the first matching brand wins.
+ * `opus` never matches the OpenAI o-series and `command` never matches a
+ * substring. The o-series is restricted to OpenAI's real reasoning models
+ * (`o1`/`o3`/`o4`, not the never-shipped `o2`) and must be a complete versioned
+ * token (end, or followed by a separator) so an unrelated slug like `o2-turbo`
+ * or `o3corp` is not misattributed. Order matters: the first matching brand wins.
  */
 const MODEL_BRAND_ICON_MATCHERS: ReadonlyArray<{ readonly icon: Icon; readonly test: RegExp }> = [
   { icon: ClaudeAI, test: /(?:^|[/\s._-])(?:claude|anthropic)/u },
   {
     icon: OpenAI,
-    test: /(?:^|[/\s._-])(?:gpt|chatgpt|openai|codex|o[1-4](?![a-z])|dall-?e|davinci)/u,
+    test: /(?:^|[/\s._-])(?:gpt|chatgpt|openai|codex|o[134](?=$|[-\s._/])|dall-?e|davinci)/u,
   },
   { icon: Gemini, test: /(?:^|[/\s._-])(?:gemini|gemma|palm|bison|google)/u },
   { icon: GrokIcon, test: /(?:^|[/\s._-])(?:grok|x-?ai)/u },
