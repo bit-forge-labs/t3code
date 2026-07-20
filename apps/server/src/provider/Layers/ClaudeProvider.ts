@@ -43,6 +43,7 @@ import {
   type ClaudeDiscoveredModel,
   type ClaudeModelDiscoveryOutcome,
 } from "./ClaudeModelDiscovery.ts";
+import type { CliProxyUsageOutcome } from "./CliProxyUsageDiscovery.ts";
 
 const DEFAULT_CLAUDE_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
   optionDescriptors: [],
@@ -961,6 +962,7 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
   ) => Effect.Effect<ClaudeCapabilitiesProbe | undefined>,
   environment?: NodeJS.ProcessEnv,
   resolveDiscovery?: () => Effect.Effect<ClaudeModelDiscoveryOutcome>,
+  resolveUsage?: () => Effect.Effect<CliProxyUsageOutcome>,
 ): Effect.fn.Return<
   ServerProviderDraft,
   never,
@@ -1113,7 +1115,34 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
   // downgrades an otherwise-ready snapshot to `warning`, but never overrides the
   // version-upgrade advisory.
   const discoveryEligible = gatewayBacked && capabilities.apiProvider !== "bedrock";
-  const discovery = discoveryEligible && resolveDiscovery ? yield* resolveDiscovery() : undefined;
+  // Model discovery and per-provider usage both hit the gateway and are
+  // independent, so run them concurrently rather than serialising their timeouts.
+  // Usage is best-effort: a failed/ineligible fetch simply omits the field and
+  // never downgrades the snapshot status.
+  const discoveryEffect =
+    discoveryEligible && resolveDiscovery
+      ? resolveDiscovery()
+      : Effect.succeed({ kind: "ineligible" } satisfies ClaudeModelDiscoveryOutcome);
+  const usageEffect =
+    discoveryEligible && resolveUsage
+      ? resolveUsage()
+      : Effect.succeed({ kind: "ineligible" } satisfies CliProxyUsageOutcome);
+  const [discovery, usageOutcome] = yield* Effect.all([discoveryEffect, usageEffect], {
+    concurrency: 2,
+  });
+  // Diagnostic (debug level): surfaces why provider usage is/ isn't present
+  // without leaking credentials. Run the server with `--log-level debug` to see.
+  yield* Effect.logDebug("CLIProxy provider usage outcome", {
+    kind: usageOutcome.kind,
+    ...(usageOutcome.kind === "failed"
+      ? { host: usageOutcome.host, detail: usageOutcome.detail }
+      : {}),
+    ...(usageOutcome.kind === "available" ? { providerCount: usageOutcome.providers.length } : {}),
+  });
+  const usage =
+    usageOutcome?.kind === "available" && usageOutcome.providers.length > 0
+      ? { fetchedAt: checkedAt, providers: usageOutcome.providers }
+      : undefined;
   // A recognized-but-empty gateway catalog is NOT treated as authoritative:
   // wiping the whole model list on a transient/misconfigured empty response is
   // worse than keeping the built-in/manual list. Only a non-empty catalog is
@@ -1143,6 +1172,7 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
     checkedAt,
     models: readyModels,
     slashCommands: dedupedSlashCommands,
+    ...(usage ? { usage } : {}),
     probe: {
       installed: true,
       version: parsedVersion,
