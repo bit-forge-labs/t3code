@@ -561,10 +561,40 @@ export function mergeClaudeModelsWithDiscovery(input: {
 }
 
 /**
+ * Overlay a discovered model's read-only context metadata onto existing
+ * capabilities, leaving option descriptors untouched.
+ *
+ * Deliberately narrower than {@link augmentBuiltInWithDiscovery}: the catalog
+ * may present the gateway's advertised effort levels, but runtime resolution
+ * must keep a built-in's tested controls. A gateway that omits T3-specific
+ * pseudo-efforts (`ultracode`, `ultrathink`) would otherwise make a stored
+ * selection unresolvable and silently downgrade it to the gateway default.
+ */
+function withDiscoveredContextMetadata(
+  caps: ModelCapabilities,
+  discovered: ClaudeDiscoveredModel,
+): ModelCapabilities {
+  const contextWindowTokens = discovered.contextWindowTokens ?? caps.contextWindowTokens;
+  const maxContextWindowTokens = discovered.maxContextWindowTokens ?? caps.maxContextWindowTokens;
+  if (
+    contextWindowTokens === caps.contextWindowTokens &&
+    maxContextWindowTokens === caps.maxContextWindowTokens
+  ) {
+    return caps;
+  }
+  return createModelCapabilities({
+    optionDescriptors: caps.optionDescriptors ?? [],
+    contextWindowTokens,
+    maxContextWindowTokens,
+  });
+}
+
+/**
  * Resolve instance-aware capabilities for a model at runtime, consulting a
- * discovery outcome for gateway models. Built-ins always win; discovered models
- * use their advertised effort/context; unknown models fall back to the portable
- * proxy set on a gateway-backed instance, else empty.
+ * discovery outcome for gateway models. A built-in keeps its tested static
+ * controls and takes only read-only context metadata from its discovered twin;
+ * discovered models use their advertised effort/context; unknown models fall
+ * back to the portable proxy set on a gateway-backed instance, else empty.
  */
 export function resolveClaudeModelCapabilitiesForInstance(input: {
   readonly model: string | null | undefined;
@@ -572,16 +602,22 @@ export function resolveClaudeModelCapabilitiesForInstance(input: {
   readonly gatewayBacked: boolean;
 }): ModelCapabilities {
   const slug = input.model?.trim();
+  const discovered =
+    slug && input.discovery?.kind === "discovered"
+      ? input.discovery.models.find((candidate) => candidate.slug === slug)
+      : undefined;
+
   const builtIn = slug ? BUILT_IN_MODELS.find((candidate) => candidate.slug === slug) : undefined;
   if (builtIn) {
-    return builtIn.capabilities ?? DEFAULT_CLAUDE_MODEL_CAPABILITIES;
+    // Adopt the window the gateway advertises rather than silently falling back
+    // to the hardcoded default — the settings chip and the context meter read
+    // from the two paths and have to agree on the window.
+    const caps = builtIn.capabilities ?? DEFAULT_CLAUDE_MODEL_CAPABILITIES;
+    return discovered ? withDiscoveredContextMetadata(caps, discovered) : caps;
   }
 
-  if (slug && input.discovery?.kind === "discovered") {
-    const discovered = input.discovery.models.find((candidate) => candidate.slug === slug);
-    if (discovered) {
-      return buildDiscoveredClaudeModelCapabilities(discovered, input.gatewayBacked);
-    }
+  if (discovered) {
+    return buildDiscoveredClaudeModelCapabilities(discovered, input.gatewayBacked);
   }
 
   return input.gatewayBacked ? CLAUDE_PROXY_EFFORT_CAPABILITIES : DEFAULT_CLAUDE_MODEL_CAPABILITIES;

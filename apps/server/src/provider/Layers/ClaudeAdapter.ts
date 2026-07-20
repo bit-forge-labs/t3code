@@ -358,10 +358,23 @@ function selectedClaudeContextWindow(
     return 200_000;
   }
 
-  // A gateway model reports its window as read-only metadata rather than a
-  // selectable option; prefer it over the built-in defaults below so a
-  // proxied same-named model isn't forced to a hardcoded window.
   const resolvedCaps = caps ?? getClaudeModelCapabilities(modelSelection?.model);
+
+  // A model that exposes a context-window selector routes by that selection
+  // (the `[1m]` suffix), so its unset default is 200k regardless of the larger
+  // window a gateway may advertise as metadata. Seeding the advertised value
+  // here would show a window the request never asks for, then snap back once
+  // SDK telemetry reports the real one.
+  const hasContextWindowOption = getProviderOptionDescriptors({ caps: resolvedCaps }).some(
+    (descriptor) => descriptor.type === "select" && descriptor.id === "contextWindow",
+  );
+  if (hasContextWindowOption) {
+    return 200_000;
+  }
+
+  // Otherwise a gateway model reports its window as read-only metadata; prefer
+  // it over the built-in defaults below so a proxied same-named model isn't
+  // forced to a hardcoded window.
   if (resolvedCaps.contextWindowTokens !== undefined) {
     return resolvedCaps.contextWindowTokens;
   }
@@ -372,12 +385,6 @@ function selectedClaudeContextWindow(
       return 1_000_000;
   }
 
-  const hasContextWindowOption = getProviderOptionDescriptors({ caps: resolvedCaps }).some(
-    (descriptor) => descriptor.type === "select" && descriptor.id === "contextWindow",
-  );
-  if (hasContextWindowOption) {
-    return 200_000;
-  }
   return undefined;
 }
 

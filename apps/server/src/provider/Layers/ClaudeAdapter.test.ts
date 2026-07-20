@@ -1898,6 +1898,85 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("seeds 200k for a selectable context window even when a gateway advertises 1m", () => {
+    // A model exposing a `contextWindow` selector routes by that selection, so
+    // its unset default stays 200k; seeding the gateway's advertised 1m would
+    // show a window the request never asks for.
+    const harness = makeHarness({
+      resolveModelCapabilities: () =>
+        Effect.succeed(
+          createModelCapabilities({
+            optionDescriptors: [
+              {
+                id: "contextWindow",
+                label: "Context",
+                type: "select",
+                options: [
+                  { id: "200k", label: "200k", isDefault: true },
+                  { id: "1m", label: "1m" },
+                ],
+              },
+            ],
+            contextWindowTokens: 1_000_000,
+          }),
+        ),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 7).pipe(
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "hello",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-opus-4-6",
+        },
+        attachments: [],
+      });
+
+      // No `modelUsage`, so the seeded window survives into the usage snapshot.
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        duration_ms: 1234,
+        duration_api_ms: 1200,
+        num_turns: 1,
+        result: "done",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-seeded-window",
+        usage: {
+          input_tokens: 4,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          output_tokens: 6,
+        },
+      } as unknown as SDKMessage);
+      harness.query.finish();
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const usageEvent = runtimeEvents.find((event) => event.type === "thread.token-usage.updated");
+      assert.equal(usageEvent?.type, "thread.token-usage.updated");
+      if (usageEvent?.type === "thread.token-usage.updated") {
+        assert.equal(usageEvent.payload.usage.maxTokens, 200_000);
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("clamps oversized Claude usage to the reported context window", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
