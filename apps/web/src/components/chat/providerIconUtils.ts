@@ -1,5 +1,5 @@
 import { ProviderDriverKind } from "@t3tools/contracts";
-import { ClaudeAI, CursorIcon, GrokIcon, Icon, OpenAI, OpenCodeIcon } from "../Icons";
+import { ClaudeAI, CursorIcon, Gemini, GrokIcon, Icon, OpenAI, OpenCodeIcon } from "../Icons";
 import { PROVIDER_OPTIONS } from "../../session-logic";
 
 export const PROVIDER_ICON_BY_PROVIDER: Partial<Record<ProviderDriverKind, Icon>> = {
@@ -9,6 +9,49 @@ export const PROVIDER_ICON_BY_PROVIDER: Partial<Record<ProviderDriverKind, Icon>
   [ProviderDriverKind.make("cursor")]: CursorIcon,
   [ProviderDriverKind.make("grok")]: GrokIcon,
 };
+
+/**
+ * Per-model service-brand matchers. A model's icon should reflect the upstream
+ * service (OpenAI for `gpt-*`, Google for `gemini-*`, …), not the provider
+ * driver it happens to be routed through. This matters for aggregating
+ * providers — a Claude instance pointed at a gateway (CLIProxyAPI), Cursor, or
+ * OpenCode — where a single instance serves models from many vendors.
+ *
+ * Each token must sit on a boundary (start, or after `/ . _ -` / whitespace) so
+ * `opus` never matches the OpenAI o-series and `command` never matches a
+ * substring. The o-series is restricted to OpenAI's real reasoning models
+ * (`o1`/`o3`/`o4`, not the never-shipped `o2`) and must be a complete versioned
+ * token (end, or followed by a separator) so an unrelated slug like `o2-turbo`
+ * or `o3corp` is not misattributed. Order matters: the first matching brand wins.
+ */
+const MODEL_BRAND_ICON_MATCHERS: ReadonlyArray<{ readonly icon: Icon; readonly test: RegExp }> = [
+  { icon: ClaudeAI, test: /(?:^|[/\s._-])(?:claude|anthropic)/u },
+  {
+    icon: OpenAI,
+    test: /(?:^|[/\s._-])(?:gpt|chatgpt|openai|codex|o[134](?=$|[-\s._/])|dall-?e|davinci)/u,
+  },
+  { icon: Gemini, test: /(?:^|[/\s._-])(?:gemini|gemma|palm|bison|google)/u },
+  { icon: GrokIcon, test: /(?:^|[/\s._-])(?:grok|x-?ai)/u },
+];
+
+/**
+ * Resolve the icon for a model row. Prefers the model's own service brand
+ * (inferred from its `subProvider` vendor tag and slug), falling back to the
+ * provider driver's icon when the brand can't be identified.
+ */
+export function resolveModelServiceIcon(input: {
+  readonly slug: string;
+  readonly subProvider?: string | undefined;
+  readonly driverKind: ProviderDriverKind;
+}): Icon | null {
+  const haystack = `${input.subProvider ?? ""} ${input.slug}`.toLowerCase();
+  for (const { icon, test } of MODEL_BRAND_ICON_MATCHERS) {
+    if (test.test(haystack)) {
+      return icon;
+    }
+  }
+  return PROVIDER_ICON_BY_PROVIDER[input.driverKind] ?? null;
+}
 
 function isAvailableProviderOption(option: (typeof PROVIDER_OPTIONS)[number]): option is {
   value: ProviderDriverKind;
